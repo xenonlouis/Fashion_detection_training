@@ -18,7 +18,7 @@ else:
 # Constants
 BATCH_SIZE = 32
 IMAGE_SIZE = 224
-EPOCHS = 3
+EPOCHS = 20
 AUTOTUNE = tf.data.AUTOTUNE
 VALIDATION_SPLIT = 0.2
 SHUFFLE_BUFFER = 10000  # Increased shuffle buffer

@@ -11,9 +11,14 @@ import matplotlib.gridspec as gridspec
 import logging
 from datetime import datetime
 import traceback
+from model.color_analyzer import ColorAnalyzer
+from typing import Dict
 
 # Constants
 IMAGE_SIZE = 224
+
+# Initialize color analyzer
+color_analyzer = ColorAnalyzer(n_colors=5)
 
 def setup_logging():
     # Create logs directory if it doesn't exist
@@ -117,7 +122,7 @@ def predict_fashion(model, image_path, category_names, attribute_names):
     # Convert attribute logits to probabilities
     attribute_probs = tf.nn.sigmoid(attribute_preds[0])
     
-    # Format results
+    # Format base results
     results = {
         'image_path': image_path,
         'top_categories': [
@@ -137,22 +142,63 @@ def predict_fashion(model, image_path, category_names, attribute_names):
         ]
     }
     
+    # Analyze colors
+    try:
+        color_results = color_analyzer.analyze_image_colors(image_path)
+        if color_results:
+            # Convert color results to the expected format
+            formatted_colors = []
+            for color in color_results.get('dominant_colors', []):
+                formatted_colors.append({
+                    'name': color.get('name', 'Unknown'),
+                    'percentage': color.get('percentage', 0),
+                    'rgb': color.get('rgb', [0, 0, 0])
+                })
+            
+            results['colors'] = formatted_colors
+            results['primary_color'] = color_results.get('primary_color', {}).get('name', 'Unknown')
+            results['color_scheme'] = {
+                'temperature': color_results.get('color_scheme', {}).get('temperature', 'neutral'),
+                'brightness': color_results.get('color_scheme', {}).get('brightness', 'medium')
+            }
+    except Exception as e:
+        logging.warning(f"Color analysis failed: {str(e)}")
+    
     return results
 
 def visualize_prediction(image_path, results):
     # Create figure with custom layout
-    fig = plt.figure(figsize=(15, 8))
-    gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1.2])
+    fig = plt.figure(figsize=(15, 10))
+    gs = gridspec.GridSpec(2, 2, width_ratios=[1, 1.2], height_ratios=[2, 1])
     
-    # Left subplot for image
-    ax_img = plt.subplot(gs[0])
+    # Top left subplot for original image
+    ax_img = plt.subplot(gs[0, 0])
     img = Image.open(image_path)
     ax_img.imshow(img)
+    ax_img.set_title('Original Image', pad=10)
     ax_img.axis('off')
     
-    # Right subplot for predictions
-    ax_pred = plt.subplot(gs[1])
+    # Top right subplot for predictions and color swatches
+    ax_pred = plt.subplot(gs[0, 1])
     ax_pred.axis('off')
+    
+    # Create color swatches if color data exists
+    if 'colors' in results and results['colors']:
+        n_colors = len(results['colors'])
+        swatch_height = 0.8 / max(n_colors, 1)
+        
+        for i, color in enumerate(results['colors']):
+            if color.get('percentage', 0) > 0.05:  # Only show colors with >5% presence
+                # Create color rectangle
+                rgb = np.array(color.get('rgb', [0, 0, 0])) / 255.0
+                rect = plt.Rectangle((0.7, 0.9 - (i+1)*swatch_height), 0.2, swatch_height,
+                                   facecolor=rgb, edgecolor='black', linewidth=1)
+                ax_pred.add_patch(rect)
+                
+                # Add color percentage
+                ax_pred.text(0.92, 0.9 - (i+0.5)*swatch_height, 
+                            f"{color.get('percentage', 0):.1%}",
+                            ha='left', va='center')
     
     # Add predictions text
     text_content = []
@@ -171,7 +217,6 @@ def visualize_prediction(image_path, results):
     # Add attributes
     if results['attributes']:
         text_content.append("\nDetected Attributes:")
-        # Sort attributes by confidence
         sorted_attrs = sorted(results['attributes'], 
                             key=lambda x: x['confidence'], 
                             reverse=True)
@@ -190,6 +235,52 @@ def visualize_prediction(image_path, results):
                 bbox=dict(facecolor='white', 
                          edgecolor='lightgray',
                          boxstyle='round,pad=1'))
+    
+    # Bottom subplot for color analysis
+    ax_color = plt.subplot(gs[1, :])
+    ax_color.axis('off')
+    
+    # Add color analysis text if color data exists
+    color_text = []
+    color_text.append("\nColor Analysis")
+    color_text.append("-" * 40)
+    
+    if 'colors' in results and results['colors']:
+        # Add primary color if available
+        if 'primary_color' in results:
+            primary_color = str(results['primary_color']).replace('_', ' ').title()
+            color_text.append(f"\nPrimary Color: {primary_color}")
+        
+        # Add color scheme information if available
+        if 'color_scheme' in results:
+            scheme = results['color_scheme']
+            color_text.append("\nColor Properties:")
+            if 'temperature' in scheme:
+                color_text.append(f"• Temperature: {scheme['temperature']}")
+            if 'brightness' in scheme:
+                color_text.append(f"• Brightness: {scheme['brightness']}")
+        
+        # Add color distribution
+        color_text.append("\nColor Distribution:")
+        for color in results['colors']:
+            if color.get('percentage', 0) > 0.05:  # Only show colors with >5% presence
+                name = color.get('name', 'Unknown')
+                percentage = color.get('percentage', 0)
+                color_text.append(f"• {name}: {percentage:.1%}")
+    else:
+        color_text.append("\nNo color analysis available")
+    
+    # Join color text with newlines
+    full_color_text = '\n'.join(color_text)
+    
+    # Add color text to plot
+    ax_color.text(0, 1, full_color_text, 
+                 fontsize=11, 
+                 verticalalignment='top',
+                 fontfamily='monospace',
+                 bbox=dict(facecolor='white', 
+                          edgecolor='lightgray',
+                          boxstyle='round,pad=1'))
     
     # Adjust layout and save
     plt.tight_layout()
@@ -216,6 +307,25 @@ def print_results(results):
     print("\nDetected Attributes:")
     for attr in results['attributes']:
         print(f"- {attr['attribute']} ({attr['confidence']:.1%} confidence)")
+    
+    if 'colors' in results:
+        print("\nColor Analysis:")
+        if 'primary_color' in results:
+            print(f"Primary Color: {results['primary_color']}")
+        print("\nColor Distribution:")
+        for color_info in results['colors']:
+            if isinstance(color_info, dict):
+                name = color_info.get('name', 'Unknown')
+                percentage = color_info.get('percentage', 0)
+                print(f"- {name}: {percentage:.1%}")
+        
+        if 'color_scheme' in results:
+            print("\nColor Properties:")
+            scheme = results['color_scheme']
+            if 'temperature' in scheme:
+                print(f"Temperature: {scheme['temperature']}")
+            if 'brightness' in scheme:
+                print(f"Brightness: {scheme['brightness']}")
 
 def main():
     try:
