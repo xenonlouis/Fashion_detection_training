@@ -4,78 +4,187 @@ from model.fashion_classifier import FashionClassifier
 from keras import mixed_precision
 import os
 import pandas as pd
+from tensorflow.keras.callbacks import LearningRateScheduler
+
+# GPU Memory Growth setting
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    for device in physical_devices:
+        tf.config.experimental.set_memory_growth(device, True)
+    print(f'Found {len(physical_devices)} GPU(s)')
+else:
+    print('No GPU found, using CPU')
 
 # Constants
 BATCH_SIZE = 32
 IMAGE_SIZE = 224
-EPOCHS = 10
+EPOCHS = 3
 AUTOTUNE = tf.data.AUTOTUNE
+VALIDATION_SPLIT = 0.2
+SHUFFLE_BUFFER = 10000  # Increased shuffle buffer
+
+# Set mixed precision policy once
+mixed_precision.set_global_policy('mixed_float16')
+print('Compute dtype: %s' % mixed_precision.global_policy().compute_dtype)
+print('Variable dtype: %s' % mixed_precision.global_policy().variable_dtype)
+
+def cosine_decay_with_warmup(epoch, total_epochs, warmup_epochs=3, learning_rate_base=1e-4, warmup_learning_rate=0.0):
+    if epoch < warmup_epochs:
+        return warmup_learning_rate + (learning_rate_base - warmup_learning_rate) * (epoch / warmup_epochs)
+    
+    progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+    return learning_rate_base * 0.5 * (1 + np.cos(np.pi * progress))
 
 def preprocess_image(image_path):
-    # Convert tensor to string and handle path joining using tf operations
     base_path = "./deepfashion/img/"
     full_path = tf.strings.join([base_path, image_path])
     
     image = tf.io.read_file(full_path)
     image = tf.image.decode_jpeg(image, channels=3)
     image = tf.image.resize(image, [IMAGE_SIZE, IMAGE_SIZE])
-    image = tf.keras.applications.efficientnet.preprocess_input(image)
+    image = tf.cast(image, tf.float32) / 255.0
+    
+    # EfficientNetV2L normalization
+    mean = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
+    std = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
+    image = (image - mean) / std
+    
     return image
 
-def create_dataset(image_paths, category_labels, attribute_labels):
-    dataset = tf.data.Dataset.from_tensor_slices(
-        (image_paths, (category_labels, attribute_labels))
+@tf.function
+def augment_image(image):
+    """Basic image augmentations."""
+    image = tf.image.random_flip_left_right(image)
+    image = tf.image.random_brightness(image, 0.2)
+    image = tf.image.random_contrast(image, 0.8, 1.2)
+    return image
+
+@tf.function
+def mixup_batch(images, labels_cat, labels_attr, alpha=0.2):
+    """Performs MixUp on batches of images and labels."""
+    batch_size = tf.shape(images)[0]
+    
+    # Create random weights for mixing
+    weights = tf.random.uniform([batch_size], dtype=tf.float32)
+    x_weights = tf.reshape(weights, [batch_size, 1, 1, 1])
+    cat_weights = tf.reshape(weights, [batch_size, 1])
+    attr_weights = tf.reshape(weights, [batch_size, 1])
+    
+    # Create shuffled indices
+    indices = tf.random.shuffle(tf.range(batch_size))
+    
+    # Mix the data
+    mixed_images = (
+        images * x_weights + 
+        tf.gather(images, indices) * (1 - x_weights)
     )
+    
+    # Mix the labels (already in one-hot format for categories)
+    mixed_labels_cat = (
+        labels_cat * cat_weights + 
+        tf.gather(labels_cat, indices) * (1 - cat_weights)
+    )
+    mixed_labels_attr = (
+        labels_attr * attr_weights + 
+        tf.gather(labels_attr, indices) * (1 - attr_weights)
+    )
+    
+    return mixed_images, (mixed_labels_cat, mixed_labels_attr)
+
+def create_dataset(image_paths, category_labels, attribute_labels, is_training=True):
+    # Create the initial dataset
+    # Convert sparse labels to one-hot
+    category_labels_onehot = tf.one_hot(category_labels, depth=50)  # 50 categories
+    
+    dataset = tf.data.Dataset.from_tensor_slices(
+        (image_paths, (category_labels_onehot, attribute_labels))
+    )
+    
+    if is_training:
+        # Cache the raw data
+        dataset = dataset.cache()
+        # Shuffle before preprocessing
+        dataset = dataset.shuffle(buffer_size=SHUFFLE_BUFFER, reshuffle_each_iteration=True)
+    
+    # Preprocess images
     dataset = dataset.map(
         lambda x, y: (preprocess_image(x), y),
         num_parallel_calls=AUTOTUNE
     )
-    dataset = dataset.batch(BATCH_SIZE).prefetch(AUTOTUNE)
-    return dataset
-
-def create_weighted_sparse_categorical_crossentropy(class_weights):
-    def weighted_loss(y_true, y_pred):
-        # Convert class weights to tensor
-        weights_tensor = tf.convert_to_tensor(
-            [class_weights[i] for i in range(len(class_weights))], 
-            dtype=tf.float32
-        )
-        
-        # Get weights for each sample based on their true class
-        sample_weights = tf.gather(weights_tensor, tf.cast(y_true, tf.int32))
-        
-        # Calculate regular sparse categorical crossentropy
-        unweighted_losses = tf.keras.losses.sparse_categorical_crossentropy(
-            y_true, y_pred, from_logits=False
-        )
-        
-        # Apply weights to the losses
-        weighted_losses = unweighted_losses * sample_weights
-        
-        return tf.reduce_mean(weighted_losses)
     
-    return weighted_loss
+    if is_training:
+        # Apply augmentations before batching
+        dataset = dataset.map(
+            lambda x, y: (augment_image(x), y),
+            num_parallel_calls=AUTOTUNE
+        )
+    
+    # Batch the dataset
+    dataset = dataset.batch(BATCH_SIZE)
+    
+    if is_training:
+        # Apply mixup after batching
+        dataset = dataset.map(
+            lambda x, y: mixup_batch(x, y[0], y[1]),
+            num_parallel_calls=AUTOTUNE
+        )
+    
+    # Prefetch for performance
+    return dataset.prefetch(AUTOTUNE)
 
-# Add this new class after the create_weighted_sparse_categorical_crossentropy function
 class AttributeSpecificMetrics(tf.keras.callbacks.Callback):
-    def __init__(self, attribute_names):
+    def __init__(self, attribute_names, validation_data=None):
         super(AttributeSpecificMetrics, self).__init__()
         self.attribute_names = attribute_names
+        self.validation_data = validation_data
         
     def on_epoch_end(self, epoch, logs=None):
-        # Get predictions for the entire dataset
-        predictions = self.model.predict(self.model.train_dataset)
-        y_pred = predictions[1] > 0.5  # Binary predictions for attributes
-        y_true = np.concatenate([y[1] for x, y in self.model.train_dataset])
+        if logs is None:
+            logs = {}
         
-        print("\nPer-attribute metrics:")
-        for i, attr_name in enumerate(self.attribute_names):
-            accuracy = np.mean(y_pred[:, i] == y_true[:, i])
-            precision = np.sum((y_pred[:, i] == 1) & (y_true[:, i] == 1)) / (np.sum(y_pred[:, i] == 1) + 1e-7)
-            recall = np.sum((y_pred[:, i] == 1) & (y_true[:, i] == 1)) / (np.sum(y_true[:, i] == 1) + 1e-7)
-            f1 = 2 * (precision * recall) / (precision + recall + 1e-7)
+        # Get validation dataset
+        val_dataset = self.validation_data
+        if val_dataset is None and hasattr(self.model, 'validation_data'):
+            val_dataset = self.model.validation_data
+        
+        if val_dataset is None:
+            print("Warning: No validation data found for attribute metrics")
+            return
+        
+        # Get predictions in batches to avoid memory issues
+        y_pred_list = []
+        y_true_list = []
+        
+        try:
+            # Iterate over validation dataset
+            for x_batch, y_batch in val_dataset.take(-1):  # Take all batches
+                pred_batch = self.model.predict_on_batch(x_batch)
+                if isinstance(pred_batch, (list, tuple)):
+                    pred_batch = pred_batch[1]  # Get attribute predictions
+                if isinstance(y_batch, (list, tuple)):
+                    y_batch = y_batch[1]  # Get attribute labels
+                    
+                y_pred_list.append(pred_batch)
+                y_true_list.append(y_batch)
             
-            print(f"{attr_name:15s}: Acc={accuracy:.3f}, Prec={precision:.3f}, Rec={recall:.3f}, F1={f1:.3f}")
+            # Concatenate all batches
+            if y_pred_list and y_true_list:
+                y_pred = np.concatenate(y_pred_list) > 0.5
+                y_true = np.concatenate(y_true_list)
+                
+                # Update metrics
+                for i, attr_name in enumerate(self.attribute_names):
+                    accuracy = np.mean(y_pred[:, i] == y_true[:, i])
+                    precision = np.sum((y_pred[:, i] == 1) & (y_true[:, i] == 1)) / (np.sum(y_pred[:, i] == 1) + 1e-7)
+                    recall = np.sum((y_pred[:, i] == 1) & (y_true[:, i] == 1)) / (np.sum(y_true[:, i] == 1) + 1e-7)
+                    f1 = 2 * (precision * recall) / (precision + recall + 1e-7)
+                    
+                    logs[f'attr_{i}_accuracy'] = accuracy
+                    logs[f'attr_{i}_precision'] = precision
+                    logs[f'attr_{i}_recall'] = recall
+                    logs[f'attr_{i}_f1'] = f1
+        except Exception as e:
+            print(f"Warning: Error computing attribute metrics: {str(e)}")
 
 def load_deepfashion_dataset():
     # Define file paths
@@ -84,8 +193,9 @@ def load_deepfashion_dataset():
     # Load attribute and category lists
     attr_cloth_file = os.path.join(anno_dir, "list_attr_cloth.txt")
     attr_img_file = os.path.join(anno_dir, "list_attr_img.txt")
+    category_cloth_file = os.path.join(anno_dir, "list_category_cloth.txt")
     
-    # Read attribute types - first read the count
+    # Read attribute types
     with open(attr_cloth_file, 'r') as f:
         attr_count = int(f.readline().strip())
         # Skip the header line
@@ -94,7 +204,7 @@ def load_deepfashion_dataset():
         attr_types = pd.read_csv(f, delimiter='\s+', 
                                names=['attribute_name', 'attribute_type'])
     
-    # Read image attributes - first read the count
+    # Read image attributes
     with open(attr_img_file, 'r') as f:
         img_count = int(f.readline().strip())
         # Skip the header line
@@ -111,85 +221,44 @@ def load_deepfashion_dataset():
     # Read image paths
     image_paths = pd.read_csv(train_img_paths_file, header=None, delimiter=' ')[0].tolist()
     
-    # Verify the first image path
-    print(f"Sample image path: {image_paths[0]}")
-    print(f"Full image path: {os.path.join('./deepfashion', image_paths[0])}")
-    
-    # Load attributes and categories with additional checks
+    # Load attributes and categories
     train_attributes = pd.read_csv(train_attr_file, delimiter='\s+', 
                                  header=None, dtype=np.float32).values
     train_categories = pd.read_csv(train_cate_file, header=None, 
                                  dtype=np.int32).values.ravel()
     
-    # Enhanced data validation
-    print("\nDetailed Data Validation:")
-    print(f"Categories range: {train_categories.min()} to {train_categories.max()}")
-    print(f"Unique categories: {np.unique(train_categories)}")
-    print(f"Category counts: {np.bincount(train_categories)}")
-    
-    print(f"\nAttributes stats:")
-    print(f"Min value: {train_attributes.min()}")
-    print(f"Max value: {train_attributes.max()}")
-    print(f"Mean value: {train_attributes.mean()}")
-    print(f"Sample of first 5 attribute vectors:")
-    print(train_attributes[:5])
-    
-    # Distribution of categories
-    unique_cats, cat_counts = np.unique(train_categories, return_counts=True)
-    print("\nCategory distribution:")
-    for cat, count in zip(unique_cats, cat_counts):
-        print(f"Category {cat}: {count} samples")
-    
     # Load category names and total number of categories
-    with open(os.path.join(anno_dir, "list_category_cloth.txt"), 'r') as f:
-        num_total_categories = int(f.readline().strip())  # Should be 50
+    with open(category_cloth_file, 'r') as f:
+        num_total_categories = int(f.readline().strip())
         next(f)  # Skip header
         category_names = pd.read_csv(f, delimiter='\s+', 
                                    names=['category_name', 'category_type'])
     
-    # Verify categories are 1-based index and go up to 50
-    print(f"\nTotal categories in list_category_cloth: {num_total_categories}")
-    print(f"Current categories in training data: {len(np.unique(train_categories))}")
-    
-    # No need to remap categories - keep original indices
-    # Just verify all categories are within valid range
-    assert train_categories.min() >= 1 and train_categories.max() <= num_total_categories, \
-        f"Categories should be between 1 and {num_total_categories}"
-    
-    # First adjust categories to be 0-based
-    train_categories = train_categories - 1
-    
-    # Calculate class weights for all possible categories (0 to 49)
+    # Calculate class weights
     total_samples = len(train_categories)
     class_weights = {}
+    unique_cats, cat_counts = np.unique(train_categories, return_counts=True)
     
-    # Initialize weights for all possible categories
+    # Initialize weights for all possible categories (1-based to 0-based indexing)
     for cat in range(num_total_categories):
-        samples = np.sum(train_categories == cat)
-        if samples == 0:
-            # For categories that don't appear in training set
+        cat_idx = cat + 1  # Convert to 1-based indexing to match data
+        count = cat_counts[unique_cats == cat_idx][0] if cat_idx in unique_cats else 0
+        if count == 0:
             class_weights[cat] = 1.0
         else:
-            # Calculate weight based on inverse frequency
-            class_weights[cat] = total_samples / (len(np.unique(train_categories)) * samples)
+            class_weights[cat] = total_samples / (num_total_categories * count)
     
-    print("\nClass weights (first 5):")
-    for i in range(5):
-        print(f"Category {i}: {class_weights[i]:.2f}")
+    # Convert categories to 0-based indexing
+    train_categories = train_categories - 1
     
-    # Verify weights are properly 0-based and complete
-    min_cat = min(class_weights.keys())
-    max_cat = max(class_weights.keys())
-    num_weights = len(class_weights)
-    print(f"\nClass weight range: {min_cat} to {max_cat}")
-    print(f"Number of class weights: {num_weights}")
-    assert num_weights == num_total_categories, f"Expected {num_total_categories} weights, got {num_weights}"
-    
-    print(f"Loaded {len(image_paths)} training images")
-    print(f"Number of attributes: {len(attr_types)}")
-    print(f"Attribute names: {attr_types['attribute_name'].tolist()[:5]}...")
-    print(f"Sample image path: {image_paths[0]}")
-    print(f"Sample attributes shape: {train_attributes.shape}")
+    # Data validation
+    print("\nDataset Statistics:")
+    print(f"Number of training images: {len(image_paths)}")
+    print(f"Number of attributes: {train_attributes.shape[1]}")
+    print(f"Number of categories: {num_total_categories}")
+    print(f"\nCategory distribution:")
+    for cat, count in zip(unique_cats, cat_counts):
+        print(f"Category {cat}: {count} samples")
     
     # Get attribute names for metrics
     attribute_names = attr_types['attribute_name'].tolist()
@@ -197,107 +266,121 @@ def load_deepfashion_dataset():
     return np.array(image_paths), train_categories, train_attributes, class_weights, num_total_categories, attribute_names
 
 def main():
-    # Add at the beginning of main()
-    mixed_precision.set_global_policy('mixed_float16')
+    # GPU check
+    if not tf.test.is_built_with_cuda():
+        print("WARNING: TensorFlow was not built with CUDA support")
+    else:
+        print("TensorFlow was built with CUDA support")
+        print(f"TensorFlow version: {tf.__version__}")
+        print(f"Cuda version: {tf.sysconfig.get_build_info()['cuda_version']}")
+        print(f"CUDNN version: {tf.sysconfig.get_build_info()['cudnn_version']}")
     
-    # Load your DeepFashion dataset
+    # Load dataset
     train_images, train_categories, train_attributes, class_weights, num_total_categories, attribute_names = load_deepfashion_dataset()
     
-    # Create model with total number of categories (50)
+    # Split data for validation
+    num_samples = len(train_images)
+    num_val = int(num_samples * VALIDATION_SPLIT)
+    indices = np.random.permutation(num_samples)
+    train_idx, val_idx = indices[num_val:], indices[:num_val]
+    
+    # Create datasets with optimized pipeline
+    train_dataset = create_dataset(
+        train_images[train_idx], 
+        train_categories[train_idx], 
+        train_attributes[train_idx],
+        is_training=True
+    )
+    
+    val_dataset = create_dataset(
+        train_images[val_idx], 
+        train_categories[val_idx], 
+        train_attributes[val_idx],
+        is_training=False
+    )
+    
+    # Create model (no need to specify mixed precision again)
     model = FashionClassifier(num_total_categories, train_attributes.shape[1])
     
-    num_categories = len(np.unique(train_categories))
-    num_attributes = train_attributes.shape[1]
-    
-    # Create optimizer
-    optimizer = tf.keras.optimizers.Adam(
+    # Optimizer setup
+    base_optimizer = tf.keras.optimizers.Adam(
         learning_rate=1e-4,
-        clipnorm=1.0,
         epsilon=1e-8,
         beta_1=0.9,
-        beta_2=0.999
+        beta_2=0.999,
+        clipnorm=1.0
+    )
+    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
+    
+    # Learning rate schedule
+    lr_schedule = LearningRateScheduler(
+        lambda epoch: cosine_decay_with_warmup(epoch, EPOCHS)
     )
     
-    # Create weighted loss function
-    weighted_category_loss = create_weighted_sparse_categorical_crossentropy(class_weights)
-    
-    # Create learning rate scheduler first
-    lr_schedule = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor='loss',
-        factor=0.5,
-        patience=2,
-        min_lr=1e-6,
-        verbose=1
-    )
-    
-    # Then create callbacks list
     callbacks = [
         lr_schedule,
         tf.keras.callbacks.ModelCheckpoint(
-            'checkpoints/model_{epoch:02d}',
+            'checkpoints/model_weights_{epoch:02d}-{val_loss:.2f}',
             save_best_only=True,
-            monitor='loss',
-            save_format='tf'
+            monitor='val_loss',
+            save_weights_only=True,
+            verbose=1
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor='loss',
-            patience=5,
-            restore_best_weights=True
+            monitor='val_loss',
+            patience=7,
+            restore_best_weights=True,
+            verbose=1
         ),
         tf.keras.callbacks.TerminateOnNaN(),
-        tf.keras.callbacks.CSVLogger('training_log.csv'),
-        AttributeSpecificMetrics(attribute_names)
+        tf.keras.callbacks.CSVLogger('training_log.csv', separator=',', append=False),
+        AttributeSpecificMetrics(attribute_names, validation_data=val_dataset),
+        tf.keras.callbacks.TensorBoard(
+            log_dir='./logs',
+            histogram_freq=1,
+            update_freq='epoch'
+        )
     ]
     
-    # Add per-attribute metrics to model compilation
-    attribute_metrics = [
-        [
-            tf.keras.metrics.BinaryAccuracy(name=f'attr_{i}_{name}_accuracy'),
-            tf.keras.metrics.Precision(name=f'attr_{i}_{name}_precision'),
-            tf.keras.metrics.Recall(name=f'attr_{i}_{name}_recall')
-        ]
-        for i, name in enumerate(attribute_names)
-    ]
-    
-    # Flatten the list of metrics
-    all_attribute_metrics = [metric for metrics_list in attribute_metrics for metric in metrics_list]
-    
+    # Compile model with loss scaling for mixed precision
     model.compile(
         optimizer=optimizer,
         loss={
-            'output_1': weighted_category_loss,
-            'output_2': tf.keras.losses.BinaryCrossentropy(
+            'output_1': tf.keras.losses.CategoricalCrossentropy(
                 from_logits=False,
-                reduction='auto'
+                label_smoothing=0.1
+            ),
+            'output_2': tf.keras.losses.BinaryCrossentropy(
+                from_logits=False
             )
         },
         loss_weights={
-            'output_1': 1.0,
-            'output_2': 1.0
+            'output_1': 2.0,
+            'output_2': 0.5
         },
         metrics={
             'output_1': [
                 'accuracy',
-                tf.keras.metrics.SparseCategoricalAccuracy(name='top1_accuracy'),
-                tf.keras.metrics.SparseTopKCategoricalAccuracy(k=5, name='top5_accuracy')
+                tf.keras.metrics.CategoricalAccuracy(name='top1_accuracy'),
+                tf.keras.metrics.TopKCategoricalAccuracy(k=5, name='top5_accuracy')
             ],
             'output_2': [
                 'binary_accuracy',
                 tf.keras.metrics.AUC(name='auc'),
                 tf.keras.metrics.Precision(name='precision'),
                 tf.keras.metrics.Recall(name='recall')
-            ] + all_attribute_metrics  # Add flattened attribute metrics
+            ]
         }
     )
     
-    # Create dataset
-    train_dataset = create_dataset(train_images, train_categories, train_attributes)
-    
-    # Train with more detailed metrics
+    # Train with updated settings
     model.fit(
         train_dataset,
         epochs=EPOCHS,
-        callbacks=callbacks
+        validation_data=val_dataset,
+        callbacks=callbacks,
+        verbose=1,
+        validation_freq=1  # Ensure validation runs every epoch
     )
 
 if __name__ == "__main__":
