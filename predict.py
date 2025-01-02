@@ -12,12 +12,11 @@ import logging
 from datetime import datetime
 import traceback
 from model.color_analyzer import ColorAnalyzer
-from typing import Dict
 
 # Constants
 IMAGE_SIZE = 224
 
-# Initialize color analyzer
+# Add color analyzer to constants
 color_analyzer = ColorAnalyzer(n_colors=5)
 
 def setup_logging():
@@ -49,7 +48,9 @@ logging.info('Compute dtype: %s' % mixed_precision.global_policy().compute_dtype
 logging.info('Variable dtype: %s' % mixed_precision.global_policy().variable_dtype)
 
 # Set style for modern look
-plt.style.use('default')  # Use default style instead of seaborn
+#plt.style.use('default')  # Use default style instead of seaborn
+plt.style.use("seaborn-v0_8")
+
 plt.rcParams.update({
     'figure.facecolor': 'white',
     'axes.facecolor': 'white',
@@ -122,7 +123,7 @@ def predict_fashion(model, image_path, category_names, attribute_names):
     # Convert attribute logits to probabilities
     attribute_probs = tf.nn.sigmoid(attribute_preds[0])
     
-    # Format base results
+    # Format results
     results = {
         'image_path': image_path,
         'top_categories': [
@@ -142,27 +143,17 @@ def predict_fashion(model, image_path, category_names, attribute_names):
         ]
     }
     
-    # Analyze colors
-    try:
-        color_results = color_analyzer.analyze_image_colors(image_path)
-        if color_results:
-            # Convert color results to the expected format
-            formatted_colors = []
-            for color in color_results.get('dominant_colors', []):
-                formatted_colors.append({
-                    'name': color.get('name', 'Unknown'),
-                    'percentage': color.get('percentage', 0),
-                    'rgb': color.get('rgb', [0, 0, 0])
-                })
-            
-            results['colors'] = formatted_colors
-            results['primary_color'] = color_results.get('primary_color', {}).get('name', 'Unknown')
-            results['color_scheme'] = {
-                'temperature': color_results.get('color_scheme', {}).get('temperature', 'neutral'),
-                'brightness': color_results.get('color_scheme', {}).get('brightness', 'medium')
-            }
-    except Exception as e:
-        logging.warning(f"Color analysis failed: {str(e)}")
+    # Add color analysis
+    color_analysis = color_analyzer.analyze_image_colors(image_path)
+    
+    # Update results dictionary with all color analysis data
+    results.update({
+        'colors': color_analysis['dominant_colors'],
+        'primary_color': color_analysis['primary_color'],
+        'color_palette': color_analysis['color_palette'],
+        'color_scheme': color_analysis['color_scheme'],
+        'color_properties': color_analysis['color_properties']
+    })
     
     return results
 
@@ -182,23 +173,22 @@ def visualize_prediction(image_path, results):
     ax_pred = plt.subplot(gs[0, 1])
     ax_pred.axis('off')
     
-    # Create color swatches if color data exists
-    if 'colors' in results and results['colors']:
-        n_colors = len(results['colors'])
-        swatch_height = 0.8 / max(n_colors, 1)
-        
-        for i, color in enumerate(results['colors']):
-            if color.get('percentage', 0) > 0.05:  # Only show colors with >5% presence
-                # Create color rectangle
-                rgb = np.array(color.get('rgb', [0, 0, 0])) / 255.0
-                rect = plt.Rectangle((0.7, 0.9 - (i+1)*swatch_height), 0.2, swatch_height,
-                                   facecolor=rgb, edgecolor='black', linewidth=1)
-                ax_pred.add_patch(rect)
-                
-                # Add color percentage
-                ax_pred.text(0.92, 0.9 - (i+0.5)*swatch_height, 
-                            f"{color.get('percentage', 0):.1%}",
-                            ha='left', va='center')
+    # Create color swatches
+    n_colors = len(results['colors'])
+    swatch_height = 0.8 / n_colors
+    
+    for i, color in enumerate(results['colors']):
+        if color['percentage'] > 5:  # Only show colors with >5% presence
+            # Create color rectangle
+            rgb = np.array(color['rgb']) / 255.0
+            rect = plt.Rectangle((0.7, 0.9 - (i+1)*swatch_height), 0.2, swatch_height,
+                               facecolor=rgb, edgecolor='black', linewidth=1)
+            ax_pred.add_patch(rect)
+            
+            # Add color percentage
+            ax_pred.text(0.92, 0.9 - (i+0.5)*swatch_height, 
+                        f"{color['percentage']:.1f}%",
+                        ha='left', va='center')
     
     # Add predictions text
     text_content = []
@@ -213,6 +203,13 @@ def visualize_prediction(image_path, results):
         confidence = cat['confidence'] * 100
         if confidence > 20:  # Only show categories with >20% confidence
             text_content.append(f"{i}. {cat['category']} ({confidence:.1f}%)")
+    
+    # Add pattern analysis if available
+    if 'pattern_analysis' in results:
+        text_content.append("\nPattern Analysis:")
+        pattern = results['pattern_analysis']
+        text_content.append(f"• Type: {pattern['primary_pattern'].title()}")
+        text_content.append(f"• Description: {pattern['pattern_description']}")
     
     # Add attributes
     if results['attributes']:
@@ -240,35 +237,39 @@ def visualize_prediction(image_path, results):
     ax_color = plt.subplot(gs[1, :])
     ax_color.axis('off')
     
-    # Add color analysis text if color data exists
+    # Add color analysis text
     color_text = []
     color_text.append("\nColor Analysis")
     color_text.append("-" * 40)
     
-    if 'colors' in results and results['colors']:
-        # Add primary color if available
-        if 'primary_color' in results:
-            primary_color = str(results['primary_color']).replace('_', ' ').title()
-            color_text.append(f"\nPrimary Color: {primary_color}")
-        
-        # Add color scheme information if available
-        if 'color_scheme' in results:
-            scheme = results['color_scheme']
-            color_text.append("\nColor Properties:")
-            if 'temperature' in scheme:
-                color_text.append(f"• Temperature: {scheme['temperature']}")
-            if 'brightness' in scheme:
-                color_text.append(f"• Brightness: {scheme['brightness']}")
-        
-        # Add color distribution
-        color_text.append("\nColor Distribution:")
-        for color in results['colors']:
-            if color.get('percentage', 0) > 0.05:  # Only show colors with >5% presence
-                name = color.get('name', 'Unknown')
-                percentage = color.get('percentage', 0)
-                color_text.append(f"• {name}: {percentage:.1%}")
-    else:
-        color_text.append("\nNo color analysis available")
+    # Add primary color and scheme
+    color_text.append(f"\nPrimary Color: {results['primary_color'].replace('_', ' ').title()}")
+    
+    # Add color scheme information
+    scheme = results['color_scheme']
+    color_text.append("\nColor Scheme:")
+    color_text.append(f"• Temperature: {scheme['warm_ratio']:.1f}% Warm, {scheme['cool_ratio']:.1f}% Cool")
+    color_text.append(f"• Neutral Content: {scheme['neutral_ratio']:.1f}%")
+    if scheme['is_high_contrast']:
+        color_text.append("• High Contrast Palette")
+    elif scheme['is_mostly_light']:
+        color_text.append("• Light-dominated Palette")
+    elif scheme['is_mostly_dark']:
+        color_text.append("• Dark-dominated Palette")
+    
+    # Add detailed color breakdown
+    color_text.append("\nColor Distribution:")
+    for color in results['colors']:
+        if color['percentage'] > 5:  # Only show colors with >5% presence
+            color_name = color['color_name'].replace('_', ' ').title()
+            props = color['properties']
+            categories = ', '.join(color['categories']).title()
+            color_text.append(
+                f"• {color_name} ({color['percentage']:.1f}%) - "
+                f"[{categories}] "
+                f"{'Saturated' if props['is_saturated'] else 'Muted'}, "
+                f"{'Light' if props['is_light'] else 'Dark' if props['is_dark'] else 'Medium'}"
+            )
     
     # Join color text with newlines
     full_color_text = '\n'.join(color_text)
@@ -307,25 +308,6 @@ def print_results(results):
     print("\nDetected Attributes:")
     for attr in results['attributes']:
         print(f"- {attr['attribute']} ({attr['confidence']:.1%} confidence)")
-    
-    if 'colors' in results:
-        print("\nColor Analysis:")
-        if 'primary_color' in results:
-            print(f"Primary Color: {results['primary_color']}")
-        print("\nColor Distribution:")
-        for color_info in results['colors']:
-            if isinstance(color_info, dict):
-                name = color_info.get('name', 'Unknown')
-                percentage = color_info.get('percentage', 0)
-                print(f"- {name}: {percentage:.1%}")
-        
-        if 'color_scheme' in results:
-            print("\nColor Properties:")
-            scheme = results['color_scheme']
-            if 'temperature' in scheme:
-                print(f"Temperature: {scheme['temperature']}")
-            if 'brightness' in scheme:
-                print(f"Brightness: {scheme['brightness']}")
 
 def main():
     try:
